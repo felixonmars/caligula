@@ -4,4 +4,5 @@
 
 pub mod child;
 pub mod ipc;
+mod utils;
 mod xplat;
