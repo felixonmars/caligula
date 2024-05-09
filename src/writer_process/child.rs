@@ -6,11 +6,12 @@ use std::{
 
 use bytesize::ByteSize;
 use interprocess::local_socket::{prelude::*, GenericFilePath};
+use md5::Digest;
 use tracing::{debug, info, trace};
 use tracing_unwrap::ResultExt;
 
 use crate::childproc_common::child_init;
-use crate::compression::decompress;
+use crate::compression::{decompress, CompressionFormat};
 use crate::device;
 use crate::ipc_common::write_msg;
 
@@ -46,7 +47,24 @@ fn run(mut tx: impl Write, args: &WriterProcessConfig) -> Result<(), ErrorType> 
 
     debug!(size, "Got input file size");
 
-    write(&mut tx, args, &mut src, size)?;
+
+    debug!("Opening {} for writing", args.dest.to_string_lossy());
+
+    let mut dst = match args.target_type {
+        device::Type::File => File::create(&args.dest)?,
+        device::Type::Disk | device::Type::Partition => {
+            open_blockdev(&args.dest, args.compression)?
+        }
+    };
+
+    send_msg(
+        &mut tx,
+        StatusMessage::InitSuccess(InitialInfo { input_file_bytes: size }),
+    );
+    let mut hash = sha2::Sha256::new();
+    let block_size = ByteSize::kib(512).as_u64() as usize;
+    write(&mut tx, &mut src,  &mut dst, &mut hash, block_size, 512)?;
+
     send_msg(
         &mut tx,
         StatusMessage::FinishedWriting {
@@ -64,26 +82,62 @@ fn run(mut tx: impl Write, args: &WriterProcessConfig) -> Result<(), ErrorType> 
     Ok(())
 }
 
-fn write(
-    mut tx: impl Write,
-    args: &WriterProcessConfig,
-    src: &mut File,
-    input_file_bytes: u64,
-) -> Result<(), ErrorType> {
-    debug!("Opening {} for writing", args.dest.to_string_lossy());
+struct Writer<S: Read, D: Write, H: Write> {
+    src: S,
+    dst: D,
+    hash: H,
+    cf: CompressionFormat,
+    writebuf_size: usize,
+    disk_block_size: usize,
+}
 
-    let file = match args.target_type {
-        device::Type::File => File::create(&args.dest)?,
-        device::Type::Disk | device::Type::Partition => {
-            open_blockdev(&args.dest, args.compression)?
+impl<S: Read, D: Write, H: Write> Writer<S, D, H> {
+
+fn write(
+    &mut self,
+    mut tx: impl Write,
+    disk_block_size: usize,
+) -> Result<(), ErrorType> {
+    let mut decompress = decompress(self.cf, BufReader::new(self.src)).unwrap();
+    let mut buf = vec![0u8; self.writebuf_size];
+
+    let checkpoint_blocks: usize = 32;
+    let mut offset: u64 = 0;
+
+    'outer: loop {
+        for _ in 0..checkpoint_blocks {
+            let read_bytes = src.read(&mut buf)?;
+            if read_bytes == 0 {
+                break 'outer;
+            }
+            
+            hash.write(&buf[..read_bytes]);
+            dst.write(&buf[..writebuf_size]);
+            offset += read_bytes as u64;
         }
-    };
+
+        dst.flush()?;
+        send_msg(
+            &mut tx,
+            StatusMessage::TotalBytes {
+                src: decompress.get_mut().stream_position()?,
+                dest: offset,
+            },
+        );
+    }
+
+    dst.flush()?;
     send_msg(
-        &mut tx,
-        StatusMessage::InitSuccess(InitialInfo { input_file_bytes }),
+        tx,
+        StatusMessage::TotalBytes {
+            src: decompress.get_mut().stream_position()?,
+            dest: offset,
+        },
     );
 
-    for_each_block(&mut tx, args, src, WriteSink { file })
+    Ok(())
+}
+
 }
 
 fn verify(tx: impl Write, args: &WriterProcessConfig, src: &mut File) -> Result<(), ErrorType> {
