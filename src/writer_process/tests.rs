@@ -13,10 +13,15 @@ fn write_op_works() {
     };
     let result = test.execute();
 
+    // Every write must be the correct size
     for w in &result.requested_writes {
         assert_eq!(w.len(), test.buf_size);
     }
-    assert_eq!(&result.disk[..1024], &result.file);
+
+    // The result of the write must be correct
+    assert_eq!(&result.disk[..result.file.len()], &result.file);
+
+    // Correct events must be emitted
     assert_eq!(
         &result.events,
         &[
@@ -46,10 +51,8 @@ fn write_op_works() {
 
 #[rstest]
 fn write_misaligned_file_works(
-    #[values(0, 1, 33, 382, 438, 993)]
-    file_size: usize,
-    #[values(16, 32, 48, 64, 128)]
-    buf_size: usize,
+    #[values(0, 1, 33, 382, 438, 993)] file_size: usize,
+    #[values(16, 32, 48, 64, 128)] buf_size: usize,
 ) {
     let test = WriteTest {
         buf_size,
@@ -66,48 +69,109 @@ fn write_misaligned_file_works(
     assert_eq!(&result.disk[..test.file_size], &result.file);
 }
 
-/*
-#[test]
-fn verify_sink_multiple_blocks_incorrect() {
-    let src = make_random(1000);
-    let mut file = src.clone();
-    file[593] = 5;
-
-    let mut sink = VerifySink {
-        file: Cursor::new(file),
+#[rstest]
+fn write_file_larger_than_disk(#[values(1001, 1032, 2000, 6000, 7000)] file_size: usize) {
+    let test = WriteTest {
+        file_size,
+        buf_size: 500,
+        disk_size: 1000,
+        disk_block_size: 10,
+        checkpoint_period: 16,
     };
+    let result = test.execute();
 
-    sink.on_block(&src[..250], &mut make_random(250)).unwrap();
-    sink.on_block(&src[250..500], &mut make_random(250))
-        .unwrap();
-    let r2 = sink
-        .on_block(&src[500..750], &mut make_random(250))
-        .unwrap_err();
-
-    assert_eq!(r2, ErrorType::VerificationFailed);
+    assert_eq!(&result.disk, &result.file[..test.disk_size]);
 }
 
-#[test]
-fn verify_sink_multiple_blocks_correct() {
-    let src = make_random(1000);
-    let file = src.clone();
+#[rstest]
+fn verify_happy_case_works() {
+    let file = make_random(4096);
+    let disk = file.clone();
 
-    let mut sink = VerifySink {
-        file: Cursor::new(file),
+    let test = VerifyTest {
+        buf_size: 128,
+        file,
+        disk,
+        disk_block_size: 128,
+        checkpoint_period: 32,
     };
+    let result = test.execute();
 
-    sink.on_block(&src[..500], &mut make_random(500)).unwrap();
-    sink.on_block(&src[500..], &mut make_random(500)).unwrap();
+    assert_eq!(result.return_val, Ok(()));
 }
-*/
+
+#[rstest]
+fn verify_sad_case_works() {
+    let file = make_random(4096);
+    let mut disk = file.clone();
+    disk[10] = !disk[10];
+
+    let test = VerifyTest {
+        buf_size: 128,
+        file,
+        disk,
+        disk_block_size: 128,
+        checkpoint_period: 32,
+    };
+    let result = test.execute();
+
+    assert_eq!(result.return_val, Err(ErrorType::VerificationFailed));
+}
+
+#[rstest]
+fn verify_misaligned_case_happy_path_works(#[values(101, 103, 4348, 8337)] file_size: usize) {
+    let file = make_random(file_size);
+    let mut disk = make_random(16384);
+    disk[..file_size].copy_from_slice(&file);
+
+    let test = VerifyTest {
+        buf_size: 128,
+        file,
+        disk,
+        disk_block_size: 128,
+        checkpoint_period: 32,
+    };
+    let result = test.execute();
+
+    assert_eq!(result.return_val, Ok(()));
+}
+
+#[rstest]
+#[case(4231, 0)]
+#[case(4231, 1)]
+#[case(4231, 834)]
+#[case(4231, 4310)]
+#[case(4231, 4313)]
+#[case(4231, 4320)]
+fn verify_misaligned_case_sad_path_works(#[case] file_size: usize, #[case] flip_offset: usize) {
+    let file = make_random(file_size);
+    let mut disk = make_random(16384);
+    disk[..file_size].copy_from_slice(&file);
+    disk[flip_offset] = !disk[flip_offset];
+
+    let test = VerifyTest {
+        buf_size: 128,
+        file,
+        disk,
+        disk_block_size: 128,
+        checkpoint_period: 32,
+    };
+    let result = test.execute();
+
+    assert_eq!(result.return_val, Err(ErrorType::VerificationFailed));
+}
+
 /// Helpers for these tests. These go in their own little module to enforce
 /// visibility.
 mod helpers {
-    use std::io::*;
+    use std::io::{self, Cursor, Read, Write};
 
     use rand::RngCore;
 
-    use super::{ipc::StatusMessage, CompressionFormat, WriteOp};
+    use super::{
+        ipc::{ErrorType, StatusMessage},
+        CompressionFormat, VerifyOp, WriteOp,
+    };
 
     /// Wraps an in-memory buffer and logs every single chunk of data written to it.
     struct MockWrite<'a> {
@@ -127,7 +191,7 @@ mod helpers {
     }
 
     impl<'a> Write for MockWrite<'a> {
-        fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             assert!(
                 buf.len() % self.enforced_block_size == 0,
                 "Received a write (size {}) that was not aligned to block (size {})!",
@@ -138,7 +202,7 @@ mod helpers {
             self.cursor.write(buf)
         }
 
-        fn flush(&mut self) -> Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             self.cursor.flush()
         }
     }
@@ -161,7 +225,7 @@ mod helpers {
     }
 
     impl<'a> Read for MockRead<'a> {
-        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             if let Some(bs) = &self.enforced_block_size {
                 assert!(
                     buf.len() % bs == 0,
@@ -208,7 +272,7 @@ mod helpers {
                 disk_block_size: 8,
                 checkpoint_period: 16,
             }
-            .write(|e| events.push(e))
+            .execute(|e| events.push(e))
             .unwrap();
 
             WriteTestResult {
@@ -221,7 +285,48 @@ mod helpers {
         }
     }
 
-    fn make_random(n: usize) -> Vec<u8> {
+    pub struct VerifyTest {
+        pub buf_size: usize,
+        pub file: Vec<u8>,
+        pub disk: Vec<u8>,
+        pub disk_block_size: usize,
+        pub checkpoint_period: usize,
+    }
+
+    pub struct VerifyTestResult {
+        pub requested_file_reads: Vec<usize>,
+        pub requested_disk_reads: Vec<usize>,
+        pub events: Vec<StatusMessage>,
+        pub return_val: Result<(), ErrorType>,
+    }
+
+    impl VerifyTest {
+        pub fn execute(&self) -> VerifyTestResult {
+            let mut events = vec![];
+
+            let mut file = MockRead::new(&self.file, None);
+            let mut disk = MockRead::new(&self.disk, Some(self.disk_block_size));
+
+            let verification_result = VerifyOp {
+                file: &mut file,
+                disk: &mut disk,
+                cf: CompressionFormat::Identity,
+                buf_size: self.buf_size,
+                disk_block_size: self.disk_block_size,
+                checkpoint_period: self.checkpoint_period,
+            }
+            .execute(|e| events.push(e));
+
+            VerifyTestResult {
+                requested_file_reads: file.requested_reads,
+                requested_disk_reads: disk.requested_reads,
+                events,
+                return_val: verification_result,
+            }
+        }
+    }
+
+    pub fn make_random(n: usize) -> Vec<u8> {
         let mut rng = rand::thread_rng();
         let mut dest = vec![0; n];
         rng.fill_bytes(&mut dest);

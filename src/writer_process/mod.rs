@@ -83,7 +83,7 @@ fn run(mut tx: impl FnMut(StatusMessage), args: &WriterProcessConfig) -> Result<
         disk_block_size: 512,
         checkpoint_period: 32,
     }
-    .write(&mut tx)?;
+    .execute(&mut tx)?;
 
     tx(StatusMessage::FinishedWriting {
         verifying: args.verify,
@@ -102,9 +102,9 @@ fn run(mut tx: impl FnMut(StatusMessage), args: &WriterProcessConfig) -> Result<
         cf: args.compression,
         buf_size,
         disk_block_size: 512,
-        checkpoint_blocks: 32,
+        checkpoint_period: 32,
     }
-    .verify(tx)?;
+    .execute(tx)?;
 
     Ok(())
 }
@@ -123,7 +123,7 @@ struct WriteOp<F: Read, D: Write> {
 }
 
 impl<S: Read, D: Write> WriteOp<S, D> {
-    fn write(&mut self, mut tx: impl FnMut(StatusMessage)) -> Result<(), ErrorType> {
+    fn execute(&mut self, mut tx: impl FnMut(StatusMessage)) -> Result<(), ErrorType> {
         let mut file = decompress(self.cf, BufReader::new(CountRead::new(&mut self.file))).unwrap();
         let mut disk = CountWrite::new(&mut self.disk);
         let mut buf = vec![0u8; self.buf_size];
@@ -164,11 +164,11 @@ struct VerifyOp<F: Read, D: Read> {
     cf: CompressionFormat,
     buf_size: usize,
     disk_block_size: usize,
-    checkpoint_blocks: usize,
+    checkpoint_period: usize,
 }
 
 impl<F: Read, D: Read> VerifyOp<F, D> {
-    fn verify(&mut self, mut tx: impl FnMut(StatusMessage)) -> Result<(), ErrorType> {
+    fn execute(&mut self, mut tx: impl FnMut(StatusMessage)) -> Result<(), ErrorType> {
         let mut file = decompress(self.cf, BufReader::new(CountRead::new(&mut self.file))).unwrap();
         let mut disk = CountRead::new(&mut self.disk);
 
@@ -185,7 +185,7 @@ impl<F: Read, D: Read> VerifyOp<F, D> {
         }
 
         loop {
-            for _ in 0..self.checkpoint_blocks {
+            for _ in 0..self.checkpoint_period {
                 let read_bytes = file.read(&mut file_buf)?;
                 if read_bytes == 0 {
                     checkpoint!();
