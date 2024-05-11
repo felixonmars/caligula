@@ -21,16 +21,15 @@ use tracing_unwrap::ResultExt;
 use valuable::Valuable;
 
 use crate::{
-    childproc_common::child_init,
-    escalated_daemon::ipc::{EscalatedDaemonInitConfig, SpawnWriter},
-    ipc_common::read_msg_async,
-    run_mode::make_writer_spawn_command,
+    childproc_common::child_init, escalated_daemon::ipc::{EscalatedDaemonInitConfig, SpawnWriter}, escalation::SUCCESS_TOKEN, ipc_common::read_msg_async, run_mode::make_writer_spawn_command
 };
 
 pub mod ipc;
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn main() {
+    println!("{}", SUCCESS_TOKEN);
+
     let (sock, _) = child_init::<EscalatedDaemonInitConfig>();
 
     info!("Opening socket {sock}");
